@@ -1,83 +1,192 @@
 import { showToast } from "./utils.js";
 
-export async function loadAvailability(ids) {
-    const cityId = document.getElementById('citySelect')?.value || '1';
-    
-    if (!Array.isArray(ids) || !ids.length) {
-        console.warn('loadAvailability: нет товаров для проверки');
-        return;
+/**
+ * Сервис для работы с наличием товаров
+ * Оптимизированная версия с батчингом и кешированием
+ */
+class AvailabilityService {
+    constructor() {
+        this.cache = new Map();
+        this.cacheTimeout = 5 * 60 * 1000; // 5 минут
+        this.batchSize = 100;
+        this.apiUrl = '/api/availability';
     }
-    
-    // Разбиваем на батчи по 100 товаров
-    const batchSize = 100;
-    const batches = [];
-    
-    for (let i = 0; i < ids.length; i += batchSize) {
-        batches.push(ids.slice(i, i + batchSize));
-    }
-    
-    try {
-        // Загружаем батчи параллельно
-        const promises = batches.map(batch => {
-            const params = new URLSearchParams({
-                city_id: cityId,
-                product_ids: batch.join(',')
-            }).toString();
-            
-            return fetch(`/get_availability.php?${params}`)
-                .then(res => {
-                    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-                    return res.json();
-                })
-                .catch(err => {
-                    console.error('Ошибка загрузки батча:', err);
-                    return {}; // Возвращаем пустой объект при ошибке
-                });
-        });
+
+    /**
+     * Загрузить данные о наличии для массива товаров
+     */
+    async loadAvailability(productIds) {
+        if (!Array.isArray(productIds) || !productIds.length) {
+            console.warn('loadAvailability: нет товаров для проверки');
+            return {};
+        }
+
+        const cityId = this.getCurrentCityId();
+        const uniqueIds = [...new Set(productIds)];
         
-        const results = await Promise.all(promises);
-        const data = Object.assign({}, ...results);
+        // Проверяем кеш
+        const cached = this.checkCache(uniqueIds, cityId);
+        const idsToLoad = cached.missing;
+        
+        if (!idsToLoad.length) {
+            this.updateUI(cached.data);
+            return cached.data;
+        }
+
+        // Загружаем отсутствующие в кеше
+        const loadedData = await this.fetchBatched(idsToLoad, cityId);
+        
+        // Объединяем с кешированными
+        const allData = { ...cached.data, ...loadedData };
         
         // Обновляем UI
-        ids.forEach(id => {
-            const row = document.querySelector(`tr[data-product-id="${id}"]`);
-            if (!row) return;
-            
-            const availCell = row.querySelector(".availability-cell, .col-availability span");
-            const dateCell = row.querySelector(".delivery-date-cell, .col-delivery-date span");
-            
-            if (data[id]) {
-                if (availCell) {
-                    const qty = data[id].quantity ?? 0;
-                    availCell.textContent = qty > 0 ? `${qty} шт.` : "Нет";
-                    availCell.classList.toggle('in-stock', qty > 0);
-                    availCell.classList.toggle('out-of-stock', qty === 0);
-                }
-                
-                if (dateCell) {
-                    const date = data[id].delivery_date;
-                    dateCell.textContent = date || "—";
-                }
-            } else {
-                // Нет данных для этого товара
-                if (availCell) availCell.textContent = "—";
-                if (dateCell) dateCell.textContent = "—";
+        this.updateUI(allData);
+        
+        return allData;
+    }
+
+    /**
+     * Загрузка с разбивкой на батчи
+     */
+    async fetchBatched(productIds, cityId) {
+        const batches = this.createBatches(productIds);
+        const results = await Promise.all(
+            batches.map(batch => this.fetchBatch(batch, cityId))
+        );
+        
+        return Object.assign({}, ...results);
+    }
+
+    /**
+     * Загрузка одного батча
+     */
+    async fetchBatch(productIds, cityId) {
+        try {
+            const params = new URLSearchParams({
+                city_id: cityId,
+                product_ids: productIds.join(',')
+            });
+
+            const response = await fetch(`${this.apiUrl}?${params}`, {
+                method: 'GET',
+                headers: {
+                    'Accept': 'application/json',
+                    'X-Requested-With': 'XMLHttpRequest'
+                },
+                credentials: 'same-origin'
+            });
+
+            if (!response.ok) {
+                throw new Error(`HTTP ${response.status}`);
             }
-        });
-        
-    } catch (err) {
-        console.error('Критическая ошибка при загрузке наличия:', err);
-        showToast("Ошибка при загрузке наличия товаров", true);
-        
-        // Помечаем все ячейки как неопределенные
-        ids.forEach(id => {
-            const row = document.querySelector(`tr[data-product-id="${id}"]`);
-            if (row) {
-                const availCell = row.querySelector(".availability-cell, .col-availability span");
-                const dateCell = row.querySelector(".delivery-date-cell, .col-delivery-date span");
-                if (availCell) availCell.textContent = "Ошибка";
-                if (dateCell) dateCell.textContent = "Ошибка";
+
+            const result = await response.json();
+            
+            if (result.success && result.data) {
+                // Кешируем результаты
+                this.saveToCache(result.data, cityId);
+                return result.data;
+            }
+            
+            return {};
+            
+        } catch (error) {
+            console.error('Ошибка загрузки батча:', error);
+            return {};
+        }
+    }
+
+    /**
+     * Обновление UI элементов
+     */
+    updateUI(data) {
+        Object.entries(data).forEach(([productId, info]) => {
+            const row = document.querySelector(`tr[data-product-id="${productId}"]`);
+            if (!row) return;
+
+            // Наличие
+            const availCell = row.querySelector('.availability-cell, .col-availability span');
+            if (availCell) {
+                const qty = info.quantity || 0;
+                availCell.textContent = qty > 0 ? `${qty} шт.` : 'Нет';
+                availCell.className = qty > 10 ? 'text-success' : qty > 0 ? 'text-warning' : 'text-danger';
+            }
+
+            // Дата доставки
+            const dateCell = row.querySelector('.delivery-date-cell, .col-delivery-date span');
+            if (dateCell) {
+                dateCell.textContent = info.delivery_date || info.delivery_text || '—';
             }
         });
     }
+
+    /**
+     * Работа с кешем
+     */
+    checkCache(productIds, cityId) {
+        const data = {};
+        const missing = [];
+        const now = Date.now();
+
+        productIds.forEach(id => {
+            const key = `${cityId}_${id}`;
+            const cached = this.cache.get(key);
+            
+            if (cached && (now - cached.timestamp < this.cacheTimeout)) {
+                data[id] = cached.data;
+            } else {
+                missing.push(id);
+            }
+        });
+
+        return { data, missing };
+    }
+
+    saveToCache(data, cityId) {
+        const now = Date.now();
+        Object.entries(data).forEach(([productId, info]) => {
+            const key = `${cityId}_${productId}`;
+            this.cache.set(key, {
+                data: info,
+                timestamp: now
+            });
+        });
+
+        // Ограничиваем размер кеша
+        if (this.cache.size > 1000) {
+            const oldestKeys = Array.from(this.cache.entries())
+                .sort((a, b) => a[1].timestamp - b[1].timestamp)
+                .slice(0, 100)
+                .map(([key]) => key);
+            
+            oldestKeys.forEach(key => this.cache.delete(key));
+        }
+    }
+
+    /**
+     * Утилиты
+     */
+    getCurrentCityId() {
+        return document.getElementById('citySelect')?.value || '1';
+    }
+
+    createBatches(items) {
+        const batches = [];
+        for (let i = 0; i < items.length; i += this.batchSize) {
+            batches.push(items.slice(i, i + this.batchSize));
+        }
+        return batches;
+    }
+
+    clearCache() {
+        this.cache.clear();
+    }
+}
+
+// Экспорт синглтона
+export const availabilityService = new AvailabilityService();
+
+// Обратная совместимость
+export async function loadAvailability(ids) {
+    return availabilityService.loadAvailability(ids);
 }
