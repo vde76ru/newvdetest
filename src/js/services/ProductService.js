@@ -1,165 +1,171 @@
 /**
- * Сервис для работы с товарами
- * Использует единый API endpoint
+ * Централизованный сервис для работы с товарами
+ * Объединяет поиск, автодополнение и динамические данные
  */
 export class ProductService {
     constructor() {
-        this.apiUrl = '/api/products.php';
+        this.baseUrl = '/api';
         this.cache = new Map();
         this.cacheTimeout = 5 * 60 * 1000; // 5 минут
+        this.requestTimeout = 10000; // 10 секунд
     }
     
     /**
-     * Поиск товаров
+     * Универсальный поиск товаров
      */
     async search(params = {}) {
-        const searchParams = new URLSearchParams({
-            action: 'search',
-            q: params.query || '',
-            page: params.page || 1,
-            limit: params.limit || 20,
-            sort: params.sort || 'relevance',
-            city_id: params.city_id || this.getCurrentCityId()
-        });
+        const endpoint = `${this.baseUrl}/search`;
+        const cacheKey = this.getCacheKey('search', params);
         
-        // Добавляем фильтры
-        if (params.filters) {
-            searchParams.append('filters', JSON.stringify(params.filters));
-        }
-        
-        const cacheKey = searchParams.toString();
-        
-        // Проверяем кеш
+        // Проверка кеша
         const cached = this.getFromCache(cacheKey);
-        if (cached) {
-            return cached;
-        }
+        if (cached) return cached;
         
         try {
-            const response = await this.fetchWithTimeout(
-                `${this.apiUrl}?${searchParams}`,
-                { credentials: 'include' }
-            );
+            const response = await this.request(endpoint, params);
             
-            if (!response.ok) {
-                throw new Error(`HTTP ${response.status}`);
+            if (response.success) {
+                const result = {
+                    success: true,
+                    data: {
+                        products: response.data?.products || [],
+                        total: response.data?.total || 0,
+                        page: params.page || 1,
+                        limit: params.limit || 20,
+                        aggregations: response.data?.aggregations || {}
+                    }
+                };
+                
+                this.saveToCache(cacheKey, result);
+                return result;
             }
             
-            const data = await response.json();
-            
-            // Сохраняем в кеш только успешные ответы
-            if (data.success) {
-                this.saveToCache(cacheKey, data);
-            }
-            
-            return data;
+            return this.errorResponse('Search failed');
             
         } catch (error) {
             console.error('Search error:', error);
-            return {
-                success: false,
-                data: {
-                    products: [],
-                    total: 0,
-                    page: params.page || 1,
-                    limit: params.limit || 20,
-                    pages: 0
-                },
-                error: error.message
-            };
+            return this.errorResponse(error.message);
         }
     }
     
     /**
-     * Получить товар по ID
+     * Получить товары по ID
      */
-    async getProduct(id, cityId = null) {
-        const params = new URLSearchParams({
-            action: 'get',
-            id: id,
-            city_id: cityId || this.getCurrentCityId()
-        });
+    async getProductsByIds(ids, cityId = null) {
+        if (!ids.length) return { success: true, data: [] };
+        
+        const endpoint = `${this.baseUrl}/products/batch`;
         
         try {
-            const response = await this.fetchWithTimeout(
-                `${this.apiUrl}?${params}`,
-                { credentials: 'include' }
-            );
+            const response = await this.request(endpoint, {
+                ids: ids.join(','),
+                city_id: cityId || this.getCurrentCityId()
+            });
             
-            if (!response.ok) {
-                throw new Error(`HTTP ${response.status}`);
-            }
-            
-            return await response.json();
+            return {
+                success: true,
+                data: response.data || []
+            };
             
         } catch (error) {
-            console.error('Get product error:', error);
-            return {
-                success: false,
-                error: error.message
-            };
+            return this.errorResponse(error.message);
+        }
+    }
+    
+    /**
+     * Получить один товар
+     */
+    async getProduct(id, cityId = null) {
+        const endpoint = `${this.baseUrl}/products/${id}`;
+        const cacheKey = this.getCacheKey('product', { id, cityId });
+        
+        const cached = this.getFromCache(cacheKey);
+        if (cached) return cached;
+        
+        try {
+            const response = await this.request(endpoint, {
+                city_id: cityId || this.getCurrentCityId()
+            });
+            
+            if (response.success) {
+                this.saveToCache(cacheKey, response);
+                return response;
+            }
+            
+            return this.errorResponse('Product not found');
+            
+        } catch (error) {
+            return this.errorResponse(error.message);
         }
     }
     
     /**
      * Автодополнение
      */
-    async autocomplete(query) {
+    async autocomplete(query, limit = 10) {
         if (!query || query.length < 2) {
             return { success: true, suggestions: [] };
         }
         
-        const params = new URLSearchParams({
-            action: 'autocomplete',
-            q: query
-        });
+        const endpoint = `${this.baseUrl}/autocomplete`;
         
         try {
-            const response = await this.fetchWithTimeout(
-                `${this.apiUrl}?${params}`,
-                { credentials: 'include' },
-                3000 // 3 секунды таймаут для автодополнения
-            );
+            const response = await this.request(endpoint, { q: query, limit }, 3000);
             
-            if (!response.ok) {
-                return { success: false, suggestions: [] };
-            }
-            
-            return await response.json();
+            return {
+                success: true,
+                suggestions: response.data?.suggestions || []
+            };
             
         } catch (error) {
-            console.error('Autocomplete error:', error);
             return { success: false, suggestions: [] };
         }
     }
     
     /**
-     * Получить текущий ID города
+     * Универсальный метод запроса
      */
-    getCurrentCityId() {
-        const citySelect = document.getElementById('citySelect');
-        return citySelect ? parseInt(citySelect.value) : 1;
-    }
-    
-    /**
-     * Запрос с таймаутом
-     */
-    async fetchWithTimeout(url, options = {}, timeout = 10000) {
+    async request(url, params = {}, timeout = null) {
         const controller = new AbortController();
-        const id = setTimeout(() => controller.abort(), timeout);
+        const timeoutId = setTimeout(
+            () => controller.abort(),
+            timeout || this.requestTimeout
+        );
         
         try {
-            const response = await fetch(url, {
-                ...options,
+            // Очистка пустых параметров
+            const cleanParams = Object.entries(params)
+                .filter(([_, v]) => v !== null && v !== undefined && v !== '')
+                .reduce((acc, [k, v]) => ({ ...acc, [k]: v }), {});
+            
+            const queryString = new URLSearchParams(cleanParams).toString();
+            const fullUrl = queryString ? `${url}?${queryString}` : url;
+            
+            const response = await fetch(fullUrl, {
+                method: 'GET',
+                headers: {
+                    'Accept': 'application/json',
+                    'X-Requested-With': 'XMLHttpRequest'
+                },
+                credentials: 'same-origin',
                 signal: controller.signal
             });
-            clearTimeout(id);
-            return response;
-        } catch (error) {
-            clearTimeout(id);
-            if (error.name === 'AbortError') {
-                throw new Error('Превышено время ожидания');
+            
+            clearTimeout(timeoutId);
+            
+            if (!response.ok) {
+                throw new Error(`HTTP ${response.status}`);
             }
+            
+            return await response.json();
+            
+        } catch (error) {
+            clearTimeout(timeoutId);
+            
+            if (error.name === 'AbortError') {
+                throw new Error('Request timeout');
+            }
+            
             throw error;
         }
     }
@@ -167,6 +173,10 @@ export class ProductService {
     /**
      * Работа с кешем
      */
+    getCacheKey(type, params) {
+        return `${type}:${JSON.stringify(params)}`;
+    }
+    
     getFromCache(key) {
         const cached = this.cache.get(key);
         if (!cached) return null;
@@ -180,7 +190,8 @@ export class ProductService {
     }
     
     saveToCache(key, data) {
-        if (this.cache.size > 50) {
+        // Ограничение размера кеша
+        if (this.cache.size > 100) {
             const firstKey = this.cache.keys().next().value;
             this.cache.delete(firstKey);
         }
@@ -194,7 +205,25 @@ export class ProductService {
     clearCache() {
         this.cache.clear();
     }
+    
+    /**
+     * Утилиты
+     */
+    getCurrentCityId() {
+        return document.getElementById('citySelect')?.value || '1';
+    }
+    
+    errorResponse(message) {
+        return {
+            success: false,
+            error: message,
+            data: {
+                products: [],
+                total: 0
+            }
+        };
+    }
 }
 
-// Экспортируем синглтон
+// Экспорт синглтона
 export const productService = new ProductService();
